@@ -1,0 +1,100 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+# 上面這兩行是給編輯器（如 VS Code 或 Vim）看的，告訴它們這是一個 Ruby 檔案，請開啟 Ruby 的語法高亮。
+
+# ==========================================
+# 1. 動態抓取主機網路卡 (Windows 專用)
+# ==========================================
+# 這段指令會呼叫 PowerShell 去找出目前「用來上網」的那張實體網卡，並抓取 VirtualBox 看得懂的硬體描述。
+# 加入 [Console]::OutputEncoding 是為了確保中文字（如「乙太網路」）能以 UTF-8 格式回傳，避免 Vagrant 讀取時發生編碼崩潰。
+active_interface = `powershell -NoProfile -Command "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; (Get-NetAdapter -InterfaceIndex (Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Sort-Object RouteMetric | Select-Object -First 1).InterfaceIndex).InterfaceDescription"`.strip
+
+# Vagrant 2.x 版本的設定區塊開始
+Vagrant.configure("2") do |config|
+
+  # ==========================================
+  # 2. 虛擬機基本設定
+  # ==========================================
+  # 指定要使用的作業系統印象檔 (Box) 及其版本
+  config.vm.box = "bento/rockylinux-9.6"
+  config.vm.box_version = "202510.26.0"
+
+  # 設定虛擬機內部的電腦名稱 (Hostname)
+  config.vm.hostname = 'kgib-rockylinux-01'
+
+  # 設定 Vagrant 辨識這台機器的名稱 (這在多機架構下特別有用)
+  config.vm.define "kgib-rockylinux-01"
+
+  # ==========================================
+  # 3. 網路設定 (橋接模式)
+  # ==========================================
+  # 判斷剛才有沒有成功抓到網卡名稱
+  if active_interface.nil? || active_interface.empty?
+    puts "Warning: Could not find the active networking interface"
+    # 如果沒抓到，就啟動預設的橋接網路 (Vagrant 會在終端機跳出選單讓你手動選)
+    config.vm.network "public_network"
+  else
+    puts "Detecting the active networking interface: #{active_interface}"
+    # 如果有抓到，就直接指定橋接給那張網卡，實現「零人工干預」自動連網
+    config.vm.network "public_network", bridge: active_interface
+  end
+
+  # ==========================================
+  # 4. SSH 登入驗證設定
+  # ==========================================
+  # 告訴 Vagrant 嘗試登入時，要使用哪些私鑰。
+  # 這裡提供了一個陣列：先用 Vagrant 預設萬用鑰匙登入，之後就可以用我們自己的 ed25519 鑰匙。
+  config.ssh.private_key_path = [
+    "~/.vagrant.d/insecure_private_key",
+    "ssh/id_ed25519"
+  ]
+
+  # 禁止 Vagrant 自動產生並替換掉預設金鑰，因為我們後續要手動寫入自己的金鑰
+  config.ssh.insert_key = false
+
+  # ==========================================
+  # 5. VirtualBox 硬體資源設定
+  # ==========================================
+  config.vm.provider "virtualbox" do |vb|
+      # gui = false 代表在背景執行 (無頭模式)，不會跳出 VirtualBox 的視窗
+      vb.gui = false
+      # 設定配置 2 核心 CPU 與 2048 MB (2GB) 的記憶體
+      vb.customize ["modifyvm", :id, "--cpus", 2]
+      vb.customize ["modifyvm", :id, "--memory", 2048]
+  end
+
+  # ==========================================
+  # 6. 自動化部署 (Provisioning) - 注入 SSH 公鑰
+  # ==========================================
+  # __dir__ 是一個 Ruby 魔法變數，代表「Vagrantfile 所在的資料夾絕對路徑」。
+  # 這樣組合出來的路徑，無論同事把專案 clone 到哪裡都不會壞。
+  pub_key_path = File.expand_path("ssh/id_ed25519.pub", __dir__)
+
+  # 定義虛擬機內部的 authorized_keys 檔案位置
+  authorized_keys = "/home/vagrant/.ssh/authorized_keys"
+
+  # 檢查本機端是否有公鑰檔案，有的話才執行寫入動作
+  if File.exist?(pub_key_path)
+    # 讀取公鑰內容並去除前後多餘空白 (.strip)
+    pub_key = File.read(pub_key_path).strip
+
+    # 使用 Shell 腳本在虛擬機開機後自動執行以下指令
+    config.vm.provision "shell", inline: <<-SHELL
+      echo "Provisioning..."
+      # 確保 .ssh 目錄存在 (-p 代表如果已存在不會報錯)
+      mkdir -p "/home/vagrant/.ssh"
+
+      # 將我們的公鑰字串追加 (>>) 寫入授權名單中
+      echo "#{pub_key}" >> "#{authorized_keys}"
+
+      # 確保權限正確：目錄與檔案的擁有者必須是 vagrant
+      chown -R vagrant:vagrant /home/vagrant/.ssh
+
+      # 確保權限安全：授權名單檔案只能被擁有者讀寫 (600)
+      chmod 600 "#{authorized_keys}"
+    SHELL
+  else
+    # 如果找不到公鑰檔案，在終端機印出黃色警告，但不中斷開機流程
+    puts "Warning: SSH public key not found at #{pub_key_path}. Provisioning skipped."
+  end
+end
